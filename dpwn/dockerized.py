@@ -30,6 +30,7 @@ from pwnlib.util.misc import which
 
 from io import BytesIO
 import docker
+import dockerpty
 
 log = getLogger(__name__)
 
@@ -61,6 +62,7 @@ class dockerized(tube):
                  baseimage = None,
                  withgdb = True,
                  gdbport = 1234,
+                 reload = True,
                  *args,
                  **kwargs
                  ):
@@ -160,35 +162,47 @@ EXPOSE {self.gdbport}
                 f.write(dockerfile)
         
         self.docker_image_tag = f'pwntools_{os.path.basename(self.executable)}'
+        self.docker_container_name = self.docker_image_tag
+        self.reload = reload
         
         client = docker.from_env()
         self.debug(f'Starting to build image with tag {self.docker_image_tag}')
         client.images.build(tag=self.docker_image_tag, path=self._cwd)
         self.success(f'Built image with tag {self.docker_image_tag}')
-        self.container = client.containers.run(self.docker_image_tag, privileged=self.withgdb, ports={f'{self.gdbport}/tcp': ('127.0.0.1', self.gdbport)}, stdin_open=True, detach=True)
-        self.container_sock_stdin = self.container.attach_socket(params={'stdin': 1, 'stream': 1})
-        self.container_sock_stdout = self.container.attach_socket(params={'stdout': 1, 'stderr': 1, 'stream': 1, 'logs': 1})
+        try:
+            container = client.containers.get(self.docker_container_name)
+            if not self.reload:
+                raise RuntimeError("Container with same name already exist. ")
+            if container.attrs['Config']['Image'] != self.docker_image_tag:
+                self.warn(f"Removing container with name {self.docker_container_name} and image {container.attrs['Config']['Image']}")
+            container.remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        
+        self.container = client.containers.run(self.docker_image_tag, name=self.docker_container_name, privileged=self.withgdb, ports={f'{self.gdbport}/tcp': ('127.0.0.1', self.gdbport)}, stdin_open=True, detach=True)
+        self.container_sock_stdin_demuxed = dockerpty.io.Demuxer(self.container.attach_socket(params={'stdin': 1, 'stream': 1}))
+        self.container_sock_stdout_demuxed = dockerpty.io.Demuxer(self.container.attach_socket(params={'stdout': 1, 'stderr': 1, 'stream': 1, 'logs': 1}))
 
         if self.withgdb:
-            self.container.exec_run(['gdbserver', '--attach', '127.0.0.1:1234', '1'], privileged=True, detach=True)
-            self.gdbsock = remote('127.0.0.1', 1234)
+            self.container.exec_run(['gdbserver', '--attach', '0.0.0.0:1234', '1'], privileged=True, detach=True)
+            self.gdbsock = ('127.0.0.1', self.gdbport)
 
     def send_raw(self, data):
-        if not self.container_sock_stdin.writable:
+        if not self.container_sock_stdin_demuxed.stream.writable:
             raise EOFError
         
         try:
-            self.container_sock_stdin._sock.send(data)
+            self.container_sock_stdin_demuxed.stream._sock.send(data)
         except IOError:
             raise EOFError
     
     def recv_raw(self, numb):
-        if not self.container_sock_stdout.readable:
+        if not self.container_sock_stdout_demuxed.stream.readable:
             raise EOFError
         
         data = ''
         try:
-            data = self.container_sock_stdout.read(numb)
+            data = self.container_sock_stdout_demuxed.read(numb)
         except IOError:
             pass
         
