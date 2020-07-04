@@ -152,6 +152,9 @@ COPY ./ ./
 RUN chmod +x {self.executable}
 '''
             if self.withgdb:
+                if baseimage == 'ubuntu:19.04':
+                    dockerfile += '''RUN sed -i -re 's/([a-z]{2}\.)?archive.ubuntu.com|security.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
+'''
                 dockerfile += f'''RUN apt-get update && apt-get install -y gdb gdbserver && rm -rf /var/lib/apt/lists/*
 EXPOSE {self.gdbport}
 '''
